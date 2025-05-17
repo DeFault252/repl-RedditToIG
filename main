@@ -1,0 +1,451 @@
+import os
+import requests
+import random
+import asyncio
+import logging
+import json
+import threading
+import socket
+import asyncpraw
+import hashlib
+from instagrapi import Client
+from flask import Flask
+from PIL import Image
+import time
+import subprocess
+import ssl
+import certifi
+import urllib.parse
+from bs4 import BeautifulSoup
+from moviepy.editor import VideoFileClip
+from pathlib import Path
+
+try:
+    import moviepy.editor as mp
+    print("MoviePy imported successfully!")
+except ModuleNotFoundError as e:
+    print(f"Error: {e}")
+
+
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Flask server for UptimeRobot
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def is_port_in_use(port=8080):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+def run_server():
+    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+
+# Load secrets from environment variables
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
+INSTAGRAM_PROXIES = os.getenv("INSTAGRAM_PROXIES", "").split(",")
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+REDDIT_USERNAME = os.getenv("REDDIT_USERNAME")
+REDDIT_PASSWORD = os.getenv("REDDIT_PASSWORD")
+REDDIT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# Global variables
+reddit = None
+bot = None
+proxy_index = 0
+
+
+# Session management for Instagram login
+INSTAGRAM_SESSION_FILE = "session.json"
+
+def get_next_proxy():
+    global proxy_index
+    if INSTAGRAM_PROXIES and INSTAGRAM_PROXIES[0]:
+        proxy = INSTAGRAM_PROXIES[proxy_index % len(INSTAGRAM_PROXIES)]
+        proxy_index += 1
+        return proxy
+    return None
+
+# Store downloaded files using hashes
+DOWNLOADED_HASHES_FILE = "downloaded_hashes.json"
+if os.path.exists(DOWNLOADED_HASHES_FILE) and os.stat(DOWNLOADED_HASHES_FILE).st_size > 0:
+    with open(DOWNLOADED_HASHES_FILE, "r") as f:
+        downloaded_hashes = json.load(f)
+else:
+    downloaded_hashes = []
+
+def compute_file_hash(file_path):
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as f:
+        hasher.update(f.read())
+    return hasher.hexdigest()
+
+def save_downloaded_hash(file_hash):
+    downloaded_hashes.append(file_hash)
+    with open(DOWNLOADED_HASHES_FILE, "w") as f:
+        json.dump(downloaded_hashes, f)
+
+async def authenticate_reddit():
+    global reddit
+    try:
+        # Check if the Reddit client is already authenticated
+        if reddit:
+            user = await reddit.user.me()
+            if user:
+                logging.info(f"Already authenticated as {user.name}")
+                return  # Skip authentication if already logged in
+
+        logging.info("Authenticating with Reddit API...")
+        reddit = asyncpraw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT,
+            username=REDDIT_USERNAME,
+            password=REDDIT_PASSWORD
+        )
+        user = await reddit.user.me()
+        if user:
+            logging.info(f"Reddit authentication successful. Logged in as {user.name}")
+        else:
+            logging.error("Reddit authentication failed: user object is None")
+            reddit = None
+    except Exception as e:
+        logging.error(f"Reddit authentication failed: {e}")
+        reddit = None
+
+# Define subreddits to scrape
+SUBREDDITS = ["memes", "meme","ComedyCemetery","dank_meme","dankmemes"]
+UPLOADED_POSTS_FILE = "uploaded_posts.json"
+
+# Load previously uploaded posts
+if os.path.exists(UPLOADED_POSTS_FILE) and os.stat(UPLOADED_POSTS_FILE).st_size > 0:
+    with open(UPLOADED_POSTS_FILE, "r") as f:
+        uploaded_posts = json.load(f)
+else:
+    uploaded_posts = []
+
+def save_uploaded_post(post_id):
+    uploaded_posts.append(post_id)
+    with open(UPLOADED_POSTS_FILE, "w") as f:
+        json.dump(uploaded_posts, f)
+
+def get_reddit_video_url(post):
+    try:
+        if post.is_video:
+            return post.media['reddit_video']['fallback_url']
+    except Exception as e:
+        logging.error(f"Failed to get video URL: {e}")
+    return None
+
+def random_delay():
+    time.sleep(random.uniform(5, 15))
+
+def download_media(url, file_path):
+    for attempt in range(3):
+        try:
+            response = requests.get(url, stream=True, headers={"User-Agent": REDDIT_USER_AGENT})
+            if response.status_code == 200:
+                with open(file_path, "wb") as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+                return True
+        except Exception as e:
+            logging.error(f"Failed to download media (Attempt {attempt+1}): {e}")
+        time.sleep(2)
+    return False
+
+def build_ffmpeg_command(input_file, output_file, has_audio=True):
+    cmd = [
+        "ffmpeg", "-i", input_file,
+        "-vf", "scale='min(1080,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-movflags", "faststart",
+        "-t", "59", "-r", "24"
+    ]
+
+    if not has_audio:
+        cmd += ["-f", "lavfi", "-i", "anullsrc", "-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+
+    cmd.append(output_file)
+    return cmd
+
+def convert_media(file_path, file_extension):
+    output_path = "converted.mp4" if file_extension in ["gif", "mp4"] else "converted.jpg"
+    try:
+        if file_extension == "gif" or file_extension == "mp4":
+            temp_mp4 = "temp_video.mp4"
+            has_audio = False
+            if file_extension == "mp4":
+                result = subprocess.run(
+                    ["ffprobe", "-i", file_path, "-show_streams", "-select_streams", "a", "-loglevel", "error"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                has_audio = bool(result.stdout)
+
+            # Build FFmpeg command using the helper function
+            cmd = build_ffmpeg_command(file_path, temp_mp4, has_audio)
+            subprocess.run(cmd, check=True)
+            os.rename(temp_mp4, output_path)
+        
+        elif file_extension in ["jpg", "jpeg", "png"]:
+            # Image processing logic remains the same
+            img = Image.open(file_path)
+            img = img.resize((1080, 1080))
+            img.save(output_path)
+        
+        return output_path
+    except Exception as e:
+        logging.error(f"Failed to convert media: {e}")
+        return None
+
+def get_fun_fact_from_api():
+    try:
+        facts = []
+        for _ in range(10):
+            response = requests.get("https://uselessfacts.jsph.pl/random.json?language=en")
+            if response.status_code == 200:
+                fact_data = response.json()
+                fact = fact_data.get("text", "Here's a random fun fact!")
+                facts.append(fact)
+        return facts
+    except Exception as e:
+        logging.error(f"Failed to fetch fun facts: {e}")
+        return []
+
+def is_valid_reel(video_path):
+    try:
+        clip = VideoFileClip(video_path)
+        duration = clip.duration  # seconds
+        width, height = clip.size
+        aspect_ratio = height / width
+
+        # Check conditions for a valid reel
+        if duration > 60:
+            print("❌ Video is longer than 60 seconds.")
+            return False
+        if aspect_ratio < 1.2:  # Less than 6:5 ratio
+            print("❌ Video is not vertical enough.")
+            return False
+        if height < 720:
+            print("❌ Video resolution is too low.")
+            return False
+
+        return True
+    except Exception as e:
+        print(f"⚠️ Error checking video: {e}")
+        return False
+
+
+def auto_fix_video_for_reel(file_path):
+    """
+    Tries to fix videos that are almost meeting Instagram's reel criteria
+    (aspect ratio, duration, resolution), otherwise uploads as regular video.
+    """
+    try:
+        clip = VideoFileClip(file_path)
+        duration = clip.duration
+        width, height = clip.size
+        aspect_ratio = height / width
+
+        fixed_video_path = None
+
+        # Only fix video if it almost meets the requirements
+        if aspect_ratio < 1.2 and aspect_ratio >= 1.15:  # Almost vertical enough
+            new_height = int(width * 1.2)
+            clip = clip.resize(height=new_height)
+
+        # Fix duration if slightly over 60 seconds (e.g., between 61-65 seconds)
+        if 60 < duration <= 65:
+            clip = clip.subclip(0, 60)
+
+        # Fix resolution if slightly lower than 720px height (e.g., between 640px-719px)
+        if clip.size[1] < 720:
+            clip = clip.resize(height=720)
+
+        # After adjustments, check if we modified the video in any way
+        if aspect_ratio < 1.2 or 60 < duration <= 65 or clip.size[1] < 720:
+            fixed_video_path = "fixed_reel.mp4"
+            clip.write_videofile(fixed_video_path, codec="libx264")
+            return fixed_video_path
+
+        # If no adjustments needed, return None
+        return None
+    except Exception as e:
+        print(f"⚠️ Error fixing video: {e}")
+        return None
+
+
+def load_session():
+    """
+    Load session from the session file if it exists.
+    """
+    cl = Client()
+    if os.path.exists(INSTAGRAM_SESSION_FILE):
+        try:
+            cl.load_settings(Path(INSTAGRAM_SESSION_FILE))
+            logging.info("Session loaded from file.")
+        except Exception as e:
+            logging.error(f"Failed to load session: {e}")
+            cl = None
+    else:
+        logging.info("No session file found. Starting fresh.")
+    return cl
+
+def save_session(cl):
+    """
+    Save the current session to a session file.
+    """
+    try:
+        cl.dump_settings(INSTAGRAM_SESSION_FILE)
+        logging.info("Session saved to file.")
+    except Exception as e:
+        logging.error(f"Failed to save session: {e}")
+
+def post_to_instagram(file_path, caption, is_video=False):
+    if DRY_RUN:
+        logging.info(f"[DRY RUN] Would upload {file_path} with caption:\n{caption}")
+        return
+
+    cl = load_session()
+    if not cl:
+        logging.error("No valid Instagram session found.")
+        return
+
+    proxy = get_next_proxy()
+    if proxy:
+        logging.info(f"Using proxy: {proxy}")
+        cl.set_proxy(proxy)
+
+    try:
+        # Try login if session is not active or expired
+        try:
+            cl.get_timeline_feed()  # Test if session is valid
+            logging.info("Already logged in.")
+        except Exception:
+            logging.info("Logging into Instagram...")
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            save_session(cl)  # Save the session after successful login
+        else:
+            logging.info("Already logged in.")
+
+        if is_video:
+            if is_valid_reel(file_path):
+                logging.info("Video meets Reel criteria. Uploading as Reel.")
+                cl.video_upload(file_path, caption)  # Upload as a regular video, but it's vertical and within time limit
+            else:
+                logging.warning("Video doesn't meet Reel criteria. Uploading as a regular video.")
+                cl.video_upload(file_path, caption)  # Upload as a regular video post
+        else:
+            cl.photo_upload(file_path, caption)  # Upload as an image if not a video
+    except Exception as e:
+        logging.error(f"❌ Upload failed: {e}")
+        if "login_required" in str(e):
+            logging.warning("🔁 Retrying after fresh login...")
+            try:
+                cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                save_session(cl)  # Save session after re-login
+                if is_video:
+                    if is_valid_reel(file_path):
+                        logging.info("Video meets Reel criteria. Uploading as Reel.")
+                        cl.video_upload(file_path, caption)
+                    else:
+                        logging.warning("Video doesn't meet Reel criteria. Uploading as a regular video.")
+                        cl.video_upload(file_path, caption)
+                else:
+                    cl.photo_upload(file_path, caption)
+            except Exception as e:
+                logging.error(f"Second upload attempt failed: {e}")
+
+# Function to load the counter from a file (so it persists between script restarts)
+def load_upload_counter():
+    if os.path.exists("upload_counter.json"):
+        with open("upload_counter.json", "r") as f:
+            return json.load(f)
+    return 1  # Default starting value
+
+UPLOAD_COUNTER = load_upload_counter()
+
+# Function to save the updated counter to a file
+def save_upload_counter(counter):
+    with open("upload_counter.json", "w") as f:
+        json.dump(counter, f)
+
+async def scrape_and_post():
+    global UPLOAD_COUNTER, reddit
+    await authenticate_reddit()
+    if reddit is None:
+        return
+    try:
+        subreddit = await reddit.subreddit(random.choice(SUBREDDITS))
+        async for post in subreddit.hot(limit=10):
+            if post.id in uploaded_posts:
+                continue
+            media_url = get_reddit_video_url(post) or post.url
+            file_extension = urllib.parse.urlparse(media_url).path.split(".")[-1].split("?")[0]
+            file_path = f"downloaded.{file_extension}"
+            if download_media(media_url, file_path):
+                is_video = file_extension in ["mp4", "gif"]
+                converted_path = convert_media(file_path, file_extension)
+                fun_facts = get_fun_fact_from_api()
+
+                # Improved formatting for the fun facts list with clean numbering
+                facts_string = "\n".join([f"{i+1}. **Fact {i+1}**: {fact}" for i, fact in enumerate(fun_facts)])
+
+                caption = f"""
+                📢 {post.title}
+
+                Mined meme #️⃣{UPLOAD_COUNTER}
+
+                Credits📃: u/{post.author} from r/{post.subreddit}
+
+                Here are some fun facts for you! 😂:
+
+                {facts_string}
+
+                #meme #shitpost #joke #memes #interesting #learn #knowledge #love #photography #beautiful #follow #cute #instalike  #lifestyle #anime #gaming #bestoftheday #tagsforlikes #music #friends #memespage #humor #comedy #reddit #memes #funny #memesdaily
+                """
+                if is_video:
+                    # Try to fix the video if needed
+                    fixed_path = auto_fix_video_for_reel(converted_path)
+                    if fixed_path:
+                        converted_path = fixed_path
+
+                post_to_instagram(converted_path, caption, is_video)
+                save_uploaded_post(post.id)
+
+                # Increment upload counter after successful upload
+                UPLOAD_COUNTER += 1
+                save_upload_counter(UPLOAD_COUNTER)
+
+                if not DRY_RUN:
+                    if file_path and os.path.exists(file_path):
+                        os.remove(file_path)
+                    if converted_path and os.path.exists(converted_path):
+                        os.remove(converted_path)
+                else:
+                    logging.info(f"[DRY RUN] Would delete files: {file_path}, {converted_path}")
+                break
+
+    finally:
+        await reddit.close()
+        reddit = None
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
+    while True:
+        asyncio.run(scrape_and_post())
+        time.sleep(15)
